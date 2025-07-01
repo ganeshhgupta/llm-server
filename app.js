@@ -207,11 +207,24 @@ async function getProjectNamespaces(projectId) {
     try {
         const pool = initDatabase();
         if (!pool) {
+            console.log("❌ No database pool available");
             return [];
         }
         
         const client = await pool.connect();
         try {
+            console.log(`🔍 Querying database for project_id: ${projectId}`);
+            
+            // First, let's see what's actually in the table
+            const allDocs = await client.query(`
+                SELECT project_id, pinecone_namespace, processing_status, original_filename
+                FROM project_documents
+                WHERE project_id = $1
+                LIMIT 10
+            `, [projectId]);
+            
+            console.log(`📋 All documents for project ${projectId}:`, allDocs.rows);
+            
             const result = await client.query(`
                 SELECT DISTINCT pinecone_namespace
                 FROM project_documents
@@ -219,7 +232,7 @@ async function getProjectNamespaces(projectId) {
             `, [projectId]);
             
             const namespaces = result.rows.map(row => row.pinecone_namespace);
-            console.log(`📊 Found ${namespaces.length} namespaces for project ${projectId}`);
+            console.log(`📊 Found ${namespaces.length} namespaces for project ${projectId}:`, namespaces);
             return namespaces;
             
         } finally {
@@ -228,6 +241,7 @@ async function getProjectNamespaces(projectId) {
         
     } catch (error) {
         console.error("❌ Database query error:", error.message);
+        console.error("Full error:", error);
         return [];
     }
 }
