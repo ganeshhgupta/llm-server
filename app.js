@@ -35,11 +35,22 @@ let dbPool = null;
 async function initPinecone() {
     if (PINECONE_API_KEY && !pineconeClient) {
         try {
-            pineconeClient = new Pinecone({ apiKey: PINECONE_API_KEY });
+            // For v1.x, we need to specify environment, but we'll use v2.x approach
+            pineconeClient = new Pinecone({ 
+                apiKey: PINECONE_API_KEY
+            });
             pineconeIndex = pineconeClient.index(PINECONE_INDEX_NAME);
             console.log("✅ Pinecone initialized successfully");
         } catch (error) {
             console.error("❌ Pinecone initialization failed:", error.message);
+            // Try v2.x initialization if v1.x fails
+            try {
+                pineconeClient = new Pinecone({ apiKey: PINECONE_API_KEY });
+                pineconeIndex = pineconeClient.index(PINECONE_INDEX_NAME);
+                console.log("✅ Pinecone initialized successfully (v2 format)");
+            } catch (error2) {
+                console.error("❌ Pinecone v2 initialization also failed:", error2.message);
+            }
         }
     }
     return pineconeIndex;
@@ -152,22 +163,21 @@ async function queryEmbeddings(queryText, namespace, projectId, topK = 5, thresh
         
         console.log(`✅ Query embedding generated: ${queryEmbedding.length} dimensions`);
         
-        // Query Pinecone with correct format
+        // Query Pinecone with v2.x format
         const queryRequest = {
             vector: queryEmbedding,
             topK: topK * 2,
-            includeMetadata: true,
-            namespace: namespace
+            includeMetadata: true
         };
         
         console.log(`🔍 Pinecone query request:`, {
             vectorLength: queryEmbedding.length,
             topK: queryRequest.topK,
-            namespace: queryRequest.namespace,
+            namespace: namespace,
             includeMetadata: queryRequest.includeMetadata
         });
         
-        const results = await index.query(queryRequest);
+        const results = await index.namespace(namespace).query(queryRequest);
         
         console.log(`📊 Raw Pinecone results: ${results.matches?.length || 0} matches`);
         
