@@ -152,13 +152,22 @@ async function queryEmbeddings(queryText, namespace, projectId, topK = 5, thresh
         
         console.log(`✅ Query embedding generated: ${queryEmbedding.length} dimensions`);
         
-        // Query Pinecone
-        const results = await index.query({
-            namespace,
+        // Query Pinecone with correct format
+        const queryRequest = {
             vector: queryEmbedding,
             topK: topK * 2,
-            includeMetadata: true
+            includeMetadata: true,
+            namespace: namespace
+        };
+        
+        console.log(`🔍 Pinecone query request:`, {
+            vectorLength: queryEmbedding.length,
+            topK: queryRequest.topK,
+            namespace: queryRequest.namespace,
+            includeMetadata: queryRequest.includeMetadata
         });
+        
+        const results = await index.query(queryRequest);
         
         console.log(`📊 Raw Pinecone results: ${results.matches?.length || 0} matches`);
         
