@@ -20,7 +20,7 @@ const PINECONE_INDEX_NAME = process.env.PINECONE_INDEX_NAME || 'everleaf';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 
 console.log("=".repeat(50));
-console.log("🚀 NODE.JS GROQ SERVER WITH RAG");
+console.log("🚀 ENHANCED NODE.JS GROQ SERVER WITH SURGICAL EDITING");
 console.log(`🔑 Groq API Key: ${GROQ_API_KEY ? '✅ Ready' : '❌ Missing'}`);
 console.log(`🧠 Pinecone API Key: ${PINECONE_API_KEY ? '✅ Ready' : '❌ Missing'}`);
 console.log(`💾 Database: ${DATABASE_URL ? '✅ Ready' : '❌ Missing'}`);
@@ -35,7 +35,6 @@ let dbPool = null;
 async function initPinecone() {
     if (PINECONE_API_KEY && !pineconeClient) {
         try {
-            // For v1.x, we need to specify environment, but we'll use v2.x approach
             pineconeClient = new Pinecone({ 
                 apiKey: PINECONE_API_KEY
             });
@@ -43,7 +42,6 @@ async function initPinecone() {
             console.log("✅ Pinecone initialized successfully");
         } catch (error) {
             console.error("❌ Pinecone initialization failed:", error.message);
-            // Try v2.x initialization if v1.x fails
             try {
                 pineconeClient = new Pinecone({ apiKey: PINECONE_API_KEY });
                 pineconeIndex = pineconeClient.index(PINECONE_INDEX_NAME);
@@ -141,6 +139,109 @@ function generateEnhancedEmbedding(text) {
     }
 }
 
+// NEW: Detect if prompt is surgical editing request
+function detectSurgicalEditingRequest(message) {
+    const surgicalKeywords = [
+        'expand', 'delete', 'remove', 'replace', 'fix', 'improve', 'add to',
+        'section', 'subsection', 'introduction', 'conclusion', 'methodology',
+        'modify', 'update', 'change', 'rewrite', 'enhance'
+    ];
+    
+    const messageLower = message.toLowerCase();
+    const hasSurgicalKeywords = surgicalKeywords.some(keyword => messageLower.includes(keyword));
+    
+    // Detect section references
+    const hasSectionReference = /section\s+\d+|intro|conclusion|methodology|results|literature|background/.test(messageLower);
+    
+    // Detect targeted editing language
+    const hasTargetedLanguage = /\b(this|that|the\s+\w+\s+section|selected|highlighted)\b/.test(messageLower);
+    
+    return {
+        isSurgical: hasSurgicalKeywords || hasSectionReference,
+        hasTarget: hasSectionReference || hasTargetedLanguage,
+        confidence: (hasSurgicalKeywords ? 0.4 : 0) + (hasSectionReference ? 0.4 : 0) + (hasTargetedLanguage ? 0.2 : 0)
+    };
+}
+
+// ENHANCED: Create surgical editing system prompt
+function createSurgicalSystemPrompt(surgicalAnalysis, modelType) {
+    let basePrompt = '';
+    
+    if (surgicalAnalysis.isSurgical && surgicalAnalysis.confidence > 0.5) {
+        basePrompt = `You are a SURGICAL LaTeX editor. Your job is to make PRECISE, TARGETED changes to LaTeX documents.
+
+CRITICAL SURGICAL EDITING RULES:
+1. Make ONLY the requested changes - nothing more, nothing less
+2. If asked to modify a section, return ONLY that section's content
+3. If asked to add content, return ONLY the new content to be added
+4. If asked to delete, return empty string or confirmation comment
+5. Preserve ALL existing LaTeX syntax and formatting
+6. DO NOT add \\documentclass, \\begin{document}, or \\end{document} unless specifically requested
+7. DO NOT include content that already exists in the document
+8. Focus on the specific target mentioned in the request
+
+RESPONSE FORMAT EXAMPLES:
+- For section replacement: Return complete section with \\section{Title} header
+- For content addition: Return only the new content to be inserted
+- For deletions: Return "% Content deleted" or empty string
+- For improvements: Return the improved version of the specified content only
+
+VALIDATION:
+- Always maintain LaTeX syntax correctness
+- Preserve document structure
+- Keep changes minimal and targeted
+
+Your response will be surgically inserted into the document, so be precise.`;
+    } else {
+        basePrompt = `You are a helpful LaTeX assistant. Generate clean, proper LaTeX code that can be directly used in documents.
+
+IMPORTANT:
+- Provide working LaTeX code
+- DO NOT include \\documentclass, \\begin{document}, or \\end{document} unless specifically requested
+- Use proper LaTeX syntax and formatting
+- Make code ready for direct insertion into existing documents`;
+    }
+    
+    // Add model-specific instructions
+    if (modelType === 'code') {
+        basePrompt += `\n\nFocus on generating clean, syntactically correct LaTeX code with proper formatting.`;
+    }
+    
+    return basePrompt;
+}
+
+// ENHANCED: Context formatting for surgical editing
+function formatSurgicalContext(contextChunks, originalMessage, surgicalAnalysis) {
+    if (!contextChunks || contextChunks.length === 0) {
+        return "";
+    }
+    
+    let contextParts = [];
+    
+    if (surgicalAnalysis.isSurgical) {
+        contextParts.push("=== DOCUMENT CONTEXT FOR SURGICAL EDITING ===");
+        contextParts.push("Use this context to understand the existing document structure and content.");
+        contextParts.push("Make precise changes based on the user's request.\n");
+    } else {
+        contextParts.push("=== RELEVANT DOCUMENT INFORMATION ===\n");
+    }
+    
+    contextChunks.slice(0, 5).forEach((chunk, i) => {
+        const docName = chunk.document?.filename || 'Document';
+        contextParts.push(`[SOURCE ${i + 1} - ${docName}]`);
+        contextParts.push(chunk.text);
+        contextParts.push("---");
+    });
+    
+    if (surgicalAnalysis.isSurgical) {
+        contextParts.push("=== END CONTEXT - APPLY SURGICAL CHANGES ONLY ===\n");
+    } else {
+        contextParts.push("=== END DOCUMENT INFORMATION ===\n");
+    }
+    
+    return contextParts.join('\n');
+}
+
 // Query embeddings from Pinecone
 async function queryEmbeddings(queryText, namespace, projectId, topK = 5, threshold = -0.8) {
     try {
@@ -233,16 +334,6 @@ async function getProjectNamespaces(projectId) {
         const client = await pool.connect();
         try {
             console.log(`🔍 Querying database for project_id: ${projectId}`);
-            
-            // First, let's see what's actually in the table
-            const allDocs = await client.query(`
-                SELECT project_id, pinecone_namespace, processing_status, original_filename
-                FROM project_documents
-                WHERE project_id = $1
-                LIMIT 10
-            `, [projectId]);
-            
-            console.log(`📋 All documents for project ${projectId}:`, allDocs.rows);
             
             const result = await client.query(`
                 SELECT DISTINCT pinecone_namespace
@@ -338,187 +429,84 @@ async function getRelevantContext(projectId, queryText, maxChunks = 5) {
     }
 }
 
-// Analyze query intent
-function analyzeQueryIntent(message) {
-    const messageLower = message.toLowerCase();
+// NEW: Post-process surgical responses
+function postProcessSurgicalResponse(response, originalMessage, surgicalAnalysis) {
+    // Remove common prefixes that aren't needed
+    let cleanResponse = response.trim();
     
-    const analysis = {
-        query_type: 'general',
-        requires_multi_step: false,
-        info_needed: [],
-        temporal_aspect: 'current',
-        specificity: 'specific',
-        complexity: 'simple'
-    };
+    // Remove explanatory text that might interfere with surgical editing
+    const explanatoryPhrases = [
+        'Here is the',
+        'Here\'s the',
+        'I\'ve',
+        'I have',
+        'This is the',
+        'The following is',
+        'Below is the'
+    ];
     
-    // Detect query type
-    if (['where', 'which', 'what university', 'what college', 'school'].some(word => messageLower.includes(word))) {
-        analysis.query_type = 'location_education';
-        analysis.info_needed = ['university', 'college', 'school', 'education', 'degree'];
-    } else if (['what degree', 'studying', 'pursuing', 'major'].some(word => messageLower.includes(word))) {
-        analysis.query_type = 'degree_program';
-        analysis.info_needed = ['degree', 'major', 'program', 'thesis', 'specialization'];
-    } else if (['experience', 'work', 'job', 'position', 'role'].some(word => messageLower.includes(word))) {
-        analysis.query_type = 'professional_experience';
-        analysis.info_needed = ['work', 'job', 'position', 'experience', 'company'];
-    } else if (['skills', 'technology', 'programming', 'tools'].some(word => messageLower.includes(word))) {
-        analysis.query_type = 'technical_skills';
-        analysis.info_needed = ['skills', 'technology', 'programming', 'tools', 'languages'];
+    for (const phrase of explanatoryPhrases) {
+        if (cleanResponse.toLowerCase().startsWith(phrase.toLowerCase())) {
+            // Find the first newline or colon after the phrase
+            const breakIndex = Math.min(
+                cleanResponse.indexOf('\n') > -1 ? cleanResponse.indexOf('\n') : Infinity,
+                cleanResponse.indexOf(':') > -1 ? cleanResponse.indexOf(':') : Infinity
+            );
+            if (breakIndex < Infinity) {
+                cleanResponse = cleanResponse.substring(breakIndex + 1).trim();
+            }
+        }
     }
     
-    // Detect temporal aspect
-    if (['graduated', 'completed', 'finished', 'past'].some(word => messageLower.includes(word))) {
-        analysis.temporal_aspect = 'past';
-    } else if (['currently', 'now', 'present', 'studying', 'pursuing'].some(word => messageLower.includes(word))) {
-        analysis.temporal_aspect = 'current';
-    } else if (['will', 'future', 'plan', 'next'].some(word => messageLower.includes(word))) {
-        analysis.temporal_aspect = 'future';
+    // For deletion requests, ensure clean response
+    if (originalMessage.toLowerCase().includes('delete') || originalMessage.toLowerCase().includes('remove')) {
+        if (cleanResponse.toLowerCase().includes('deleted') || cleanResponse.toLowerCase().includes('removed')) {
+            return '% Content deleted';
+        }
     }
     
-    // Detect complexity
-    if (messageLower.includes(' and ') || message.split(' ').length > 10) {
-        analysis.complexity = 'complex';
-        analysis.requires_multi_step = true;
-    }
-    
-    return analysis;
+    return cleanResponse;
 }
 
-// Format intelligent context
-function formatIntelligentContext(contextChunks, queryAnalysis, originalMessage) {
-    if (!contextChunks || contextChunks.length === 0) {
-        return "";
+// ENHANCED: Groq request with better temperature control
+async function makeEnhancedGroqRequest(message, context, modelType, surgicalAnalysis) {
+    if (!GROQ_API_KEY) {
+        return "❌ Get free Groq API key at: https://console.groq.com/";
     }
     
-    // Score chunks based on relevance
-    const scoredChunks = contextChunks.map(chunk => ({
-        chunk,
-        score: calculateChunkRelevanceScore(chunk, queryAnalysis, originalMessage)
-    }));
+    // Create surgical system prompt
+    const systemPrompt = createSurgicalSystemPrompt(surgicalAnalysis, modelType);
     
-    // Sort by relevance score
-    scoredChunks.sort((a, b) => b.score - a.score);
-    
-    // Format context
-    const contextParts = [];
-    contextParts.push("=== RELEVANT INFORMATION FROM DOCUMENTS ===\n");
-    
-    scoredChunks.slice(0, 5).forEach((item, i) => {
-        const { chunk, score } = item;
-        const docName = chunk.document?.filename || 'Unknown document';
+    // Format message with context
+    let fullMessage = message;
+    if (context) {
+        fullMessage = `${context}\n\nUSER REQUEST: ${message}`;
         
-        contextParts.push(`[SOURCE ${i + 1} - ${docName} - Relevance: ${score.toFixed(2)}]`);
-        contextParts.push(chunk.text);
-        contextParts.push("---");
-    });
-    
-    contextParts.push("=== END OF DOCUMENT INFORMATION ===\n");
-    
-    return contextParts.join('\n');
-}
-
-// Calculate chunk relevance score
-function calculateChunkRelevanceScore(chunk, queryAnalysis, originalMessage) {
-    const chunkText = chunk.text.toLowerCase();
-    let score = 0.0;
-    
-    // Base score from similarity
-    const baseScore = chunk.score || 0.0;
-    score += baseScore * 10;
-    
-    // Keyword matching based on query type
-    queryAnalysis.info_needed.forEach(keyword => {
-        if (chunkText.includes(keyword)) {
-            score += 5.0;
-        }
-    });
-    
-    // Specific term matching
-    const queryWords = originalMessage.toLowerCase().split(' ');
-    queryWords.forEach(word => {
-        if (word.length > 3 && chunkText.includes(word)) {
-            score += 2.0;
-        }
-    });
-    
-    // Bonus for certain key phrases based on query type
-    if (queryAnalysis.query_type === 'location_education') {
-        if (['university', 'college', 'teaching assistant', 'graduate'].some(phrase => chunkText.includes(phrase))) {
-            score += 10.0;
-        }
-    } else if (queryAnalysis.query_type === 'degree_program') {
-        if (['master', 'degree', 'thesis', 'specialization'].some(phrase => chunkText.includes(phrase))) {
-            score += 10.0;
+        if (surgicalAnalysis.isSurgical) {
+            fullMessage += `\n\nIMPORTANT: This is a surgical editing request. Provide only the specific content needed for the requested change.`;
         }
     }
     
-    return score;
-}
-
-// Create adaptive system prompt
-function createAdaptiveSystemPrompt(queryAnalysis, modelType) {
-    const basePrompt = `You are an intelligent document analysis assistant. Your job is to carefully analyze the provided document information and answer questions accurately based on ONLY the information present in the documents.
-
-CRITICAL INSTRUCTIONS:
-1. Read ALL the provided document sources carefully
-2. Look for information that directly answers the user's question
-3. If you find relevant information, state it clearly and mention which document it came from
-4. If information is incomplete, say what you found and what's missing
-5. NEVER say "I don't have information" if relevant details are actually present in the sources
-6. Pay special attention to employment, education, and personal details`;
-    
-    let specificPrompt = "";
-    
-    switch (queryAnalysis.query_type) {
-        case 'location_education':
-            specificPrompt = `
-SPECIFIC FOCUS: The user is asking about educational institutions, universities, colleges, or schools.
-- Look for terms like: university, college, school, graduate, teaching assistant, student
-- Pay attention to institutional names, locations, and current/past affiliations
-- Note any degree programs, enrollment status, or educational roles`;
-            break;
-        case 'degree_program':
-            specificPrompt = `
-SPECIFIC FOCUS: The user is asking about academic degrees, programs, or specializations.
-- Look for terms like: degree, major, thesis, specialization, program, masters, bachelor
-- Pay attention to field of study, research topics, and academic focus areas
-- Note any current vs. completed educational programs`;
-            break;
-        case 'professional_experience':
-            specificPrompt = `
-SPECIFIC FOCUS: The user is asking about work experience, jobs, or professional roles.
-- Look for terms like: job, work, position, role, company, employer, experience
-- Pay attention to job titles, company names, employment dates, and responsibilities`;
-            break;
-        default:
-            specificPrompt = `
-SPECIFIC FOCUS: Provide accurate information based on the document contents.
-- Read carefully and extract relevant details
-- Be specific and cite sources when possible`;
-    }
-    
-    return basePrompt + specificPrompt;
-}
-
-// Make Groq API request
-async function makeGroqRequest(message, context, systemPrompt, modelType, queryAnalysis) {
-    // Combine message and context
-    const fullMessage = context 
-        ? `${context}\n\nUSER QUESTION: ${message}\n\nPlease answer based on the document information provided above.`
-        : message;
-    
-    // Adjust temperature based on query type
-    const temperature = ['location_education', 'degree_program'].includes(queryAnalysis.query_type) ? 0.1 : 0.3;
+    // Adjust parameters based on surgical nature
+    const temperature = surgicalAnalysis.isSurgical ? 0.05 : 0.3; // Much lower for surgical edits
+    const maxTokens = surgicalAnalysis.isSurgical ? 1500 : 2000;
     
     const models = {
         "code": "llama-3.1-8b-instant",
-        "text": "llama-3.1-8b-instant",
+        "text": "llama-3.1-8b-instant", 
         "chat": "llama-3.1-8b-instant"
     };
     
     const model = models[modelType] || "llama-3.1-8b-instant";
     
     try {
+        console.log(`🤖 Making Enhanced Groq request:`);
+        console.log(`   - Model: ${model}`);
+        console.log(`   - Temperature: ${temperature}`);
+        console.log(`   - Max Tokens: ${maxTokens}`);
+        console.log(`   - Surgical: ${surgicalAnalysis.isSurgical}`);
+        console.log(`   - Confidence: ${surgicalAnalysis.confidence}`);
+        
         const response = await axios.post(
             "https://api.groq.com/openai/v1/chat/completions",
             {
@@ -527,8 +515,12 @@ async function makeGroqRequest(message, context, systemPrompt, modelType, queryA
                     { role: "system", content: systemPrompt },
                     { role: "user", content: fullMessage }
                 ],
-                max_tokens: 2000,
-                temperature
+                max_tokens: maxTokens,
+                temperature,
+                // Enhanced parameters for surgical editing
+                top_p: surgicalAnalysis.isSurgical ? 0.1 : 0.9,
+                frequency_penalty: surgicalAnalysis.isSurgical ? 0.2 : 0.0,
+                presence_penalty: surgicalAnalysis.isSurgical ? 0.1 : 0.0
             },
             {
                 headers: {
@@ -540,33 +532,38 @@ async function makeGroqRequest(message, context, systemPrompt, modelType, queryA
         );
         
         if (response.data?.choices?.[0]?.message?.content) {
-            return response.data.choices[0].message.content.trim();
+            const aiResponse = response.data.choices[0].message.content.trim();
+            console.log(`✅ Enhanced Groq response received (${aiResponse.length} chars)`);
+            
+            // Post-process response for surgical editing
+            if (surgicalAnalysis.isSurgical) {
+                console.log('🔧 Post-processing surgical response...');
+                return postProcessSurgicalResponse(aiResponse, message, surgicalAnalysis);
+            }
+            
+            return aiResponse;
         }
         
         return `❌ Groq Error: No response content`;
         
     } catch (error) {
+        console.error(`❌ Enhanced Groq API error:`, error.response?.data || error.message);
         return `❌ Error: ${error.message}`;
     }
 }
 
-// Main function to ask Groq with context
-async function askGroqWithContext(message, contextChunks, modelType = "text") {
-    if (!GROQ_API_KEY) {
-        return "❌ Get free Groq API key at: https://console.groq.com/";
-    }
+// NEW: Enhanced ask Groq with surgical editing support
+async function askGroqWithSurgicalEditing(message, contextChunks, modelType = "text") {
+    // Analyze if this is a surgical editing request
+    const surgicalAnalysis = detectSurgicalEditingRequest(message);
     
-    // Analyze query
-    const queryAnalysis = analyzeQueryIntent(message);
+    console.log(`🔍 Surgical analysis:`, surgicalAnalysis);
     
-    // Format context
-    const formattedContext = formatIntelligentContext(contextChunks, queryAnalysis, message);
+    // Format context with surgical awareness
+    const formattedContext = formatSurgicalContext(contextChunks, message, surgicalAnalysis);
     
-    // Create system prompt
-    const systemPrompt = createAdaptiveSystemPrompt(queryAnalysis, modelType);
-    
-    // Make request
-    return await makeGroqRequest(message, formattedContext, systemPrompt, modelType, queryAnalysis);
+    // Make enhanced request
+    return await makeEnhancedGroqRequest(message, formattedContext, modelType, surgicalAnalysis);
 }
 
 // Routes
@@ -576,14 +573,19 @@ app.get('/health', (req, res) => {
         groq_configured: !!GROQ_API_KEY,
         pinecone_configured: !!PINECONE_API_KEY,
         db_configured: !!DATABASE_URL,
+        surgical_editing: true, // NEW: Indicate surgical editing support
         timestamp: new Date().toISOString()
     });
 });
 
 app.get('/test', async (req, res) => {
     try {
+        // Test surgical editing detection
+        const testMessage = "expand the introduction section with more background";
+        const surgicalAnalysis = detectSurgicalEditingRequest(testMessage);
+        
         // Test Groq
-        const groqResult = await askGroqWithContext("Write a simple hello world function in Python", [], "code");
+        const groqResult = await askGroqWithSurgicalEditing("Write a simple hello world function in Python", [], "code");
         
         // Test database
         const pool = initDatabase();
@@ -597,6 +599,7 @@ app.get('/test', async (req, res) => {
             groq_working: !groqResult.startsWith("❌"),
             database_working: dbWorking,
             pinecone_working: pineconeWorking,
+            surgical_test: surgicalAnalysis, // NEW: Show surgical detection test
             timestamp: new Date().toISOString()
         });
     } catch (error) {
@@ -604,6 +607,7 @@ app.get('/test', async (req, res) => {
     }
 });
 
+// ENHANCED: Main chat endpoint with surgical editing
 app.post('/chat', async (req, res) => {
     try {
         const { message, model_type = 'text', project_id, use_rag = false } = req.body;
@@ -612,9 +616,11 @@ app.post('/chat', async (req, res) => {
             return res.status(400).json({ error: "Message required" });
         }
         
-        console.log(`💬 Question: ${message.substring(0, 50)}...`);
-        console.log(`🎯 Project ID: ${project_id}`);
-        console.log(`🧠 Use RAG: ${use_rag}`);
+        console.log(`💬 Enhanced Chat Request:`);
+        console.log(`   - Message: ${message.substring(0, 100)}...`);
+        console.log(`   - Project ID: ${project_id}`);
+        console.log(`   - Use RAG: ${use_rag}`);
+        console.log(`   - Model Type: ${model_type}`);
         
         let contextChunks = [];
         
@@ -626,24 +632,35 @@ app.post('/chat', async (req, res) => {
             console.log(`📊 Found ${contextChunks.length} relevant chunks`);
         }
         
-        // Ask Groq with context
-        const response = await askGroqWithContext(message, contextChunks, model_type);
+        // Use enhanced surgical editing approach
+        const response = await askGroqWithSurgicalEditing(message, contextChunks, model_type);
         
-        console.log(`✅ Answer: ${response.substring(0, 50)}...`);
+        // Analyze the request for metadata
+        const surgicalAnalysis = detectSurgicalEditingRequest(message);
+        
+        console.log(`✅ Enhanced response generated`);
         
         res.json({
             response,
             model_type,
             context_used: contextChunks.length,
             success: true,
+            surgical_analysis: surgicalAnalysis, // NEW: Include surgical analysis
+            metadata: {
+                is_surgical: surgicalAnalysis.isSurgical,
+                confidence: surgicalAnalysis.confidence,
+                has_target: surgicalAnalysis.hasTarget
+            },
             timestamp: new Date().toISOString()
         });
         
     } catch (error) {
+        console.error('❌ Enhanced chat error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
+// ENHANCED: LaTeX assist with surgical editing
 app.post('/latex-assist', async (req, res) => {
     try {
         const { action, selected_text = '', request: userRequest = '', project_id, use_rag = true } = req.body;
@@ -652,31 +669,42 @@ app.post('/latex-assist', async (req, res) => {
             return res.status(400).json({ error: "Action required" });
         }
         
-        // Create prompts based on action
+        // Create surgical prompts based on action
         let prompt;
+        let isSurgicalAction = true;
+        
         switch (action) {
             case 'generate':
                 prompt = `Generate LaTeX code for: ${userRequest}`;
+                isSurgicalAction = false;
                 break;
             case 'fix':
-                prompt = `Fix this LaTeX code:\n${selected_text}\n\nRequest: ${userRequest}`;
+                prompt = `Fix this LaTeX code surgically - return only the corrected version:\n\n${selected_text}\n\nIssue to fix: ${userRequest}`;
                 break;
             case 'explain':
-                prompt = `Explain this LaTeX code:\n${selected_text}`;
+                prompt = `Explain this LaTeX code concisely:\n\n${selected_text}`;
+                isSurgicalAction = false;
                 break;
             case 'improve':
-                prompt = `Improve this LaTeX code:\n${selected_text}\n\nRequest: ${userRequest}`;
+                prompt = `Improve this LaTeX code surgically - return only the improved version:\n\n${selected_text}\n\nImprovement focus: ${userRequest}`;
                 break;
             case 'complete':
-                prompt = `Complete this LaTeX code:\n${selected_text}\n\nRequest: ${userRequest}`;
+                prompt = `Complete this LaTeX code - return only the additional content needed:\n\n${selected_text}\n\nCompletion request: ${userRequest}`;
+                break;
+            case 'delete':
+                prompt = `Confirm deletion of this LaTeX code:\n\n${selected_text}\n\nReturn "% Content deleted" to confirm or explain why it shouldn't be deleted.`;
+                break;
+            case 'expand':
+                prompt = `Expand this LaTeX content - return only the new content to add:\n\n${selected_text}\n\nExpansion request: ${userRequest}`;
                 break;
             default:
                 return res.status(400).json({ error: "Invalid action" });
         }
         
-        console.log(`🔧 LaTeX action: ${action}`);
+        console.log(`🔧 Enhanced LaTeX action: ${action}`);
         console.log(`🎯 Project ID: ${project_id}`);
         console.log(`🧠 Use RAG: ${use_rag}`);
+        console.log(`🔪 Surgical: ${isSurgicalAction}`);
         
         let contextChunks = [];
         
@@ -688,22 +716,42 @@ app.post('/latex-assist', async (req, res) => {
             console.log(`📊 Found ${contextChunks.length} relevant chunks for LaTeX`);
         }
         
-        // Ask Groq with context
-        const response = await askGroqWithContext(prompt, contextChunks, "code");
+        // Create surgical analysis for this action
+        const surgicalAnalysis = {
+            isSurgical: isSurgicalAction,
+            confidence: isSurgicalAction ? 0.9 : 0.1,
+            hasTarget: !!selected_text,
+            action: action
+        };
+        
+        // Use enhanced request for LaTeX
+        const response = await makeEnhancedGroqRequest(prompt, 
+            formatSurgicalContext(contextChunks, prompt, surgicalAnalysis), 
+            "code", 
+            surgicalAnalysis
+        );
         
         res.json({
             response,
             action,
             context_used: contextChunks.length,
             success: true,
+            surgical: isSurgicalAction, // Indicate if this was surgical
+            metadata: {
+                selected_text_length: selected_text.length,
+                has_context: contextChunks.length > 0,
+                surgical_analysis: surgicalAnalysis
+            },
             timestamp: new Date().toISOString()
         });
         
     } catch (error) {
+        console.error('❌ Enhanced LaTeX assist error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
+// Context query endpoints (unchanged)
 app.post('/api/chat/projects/:projectId/query-context', async (req, res) => {
     try {
         const { projectId } = req.params;
@@ -729,7 +777,6 @@ app.post('/api/chat/projects/:projectId/query-context', async (req, res) => {
     }
 });
 
-// Legacy endpoint for backward compatibility
 app.post('/query-context', async (req, res) => {
     try {
         const { query, project_id, max_chunks = 5 } = req.body;
@@ -777,7 +824,8 @@ async function startServer() {
     }
     
     app.listen(port, '0.0.0.0', () => {
-        console.log(`🚀 Enhanced Node.js server with RAG running on port ${port}`);
+        console.log(`🚀 Enhanced Node.js server with SURGICAL EDITING running on port ${port}`);
+        console.log(`🔪 Features: RAG, Surgical LaTeX Editing, Intent Detection`);
     });
 }
 
